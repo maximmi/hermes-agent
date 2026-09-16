@@ -258,6 +258,20 @@ model:
 #       gpt-5.4:
 #         stale_timeout_seconds: 1800  # Longer non-stream stale timeout for slow large-context turns
 
+# ``requests_per_minute`` proactively paces outbound requests to stay under a
+# provider's rate limit, instead of waiting to hit a 429. Per-model
+# providers.<id>.models.<model>.requests_per_minute wins over the
+# provider-wide providers.<id>.requests_per_minute. Unset/0/negative disables
+# pacing (the default). In-process only (not shared across separate hermes
+# processes/sessions hitting the same limit).
+#
+# providers:
+#   nim:
+#     requests_per_minute: 40    # Nvidia NIM's overall rate limit
+#     models:
+#       minimax:
+#         requests_per_minute: 40  # This model's own (tighter) limit
+
 # =============================================================================
 # Unified Timeouts (operation deadlines)
 # =============================================================================

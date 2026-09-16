@@ -39,6 +39,7 @@ from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
+from agent.rate_limit_throttle import throttle_before_request
 from agent.message_sanitization import (
     _sanitize_surrogates, _repair_tool_call_arguments, normalize_finish_reason as _normalize_finish_reason,
     sanitize_outbound_kwargs,
@@ -2036,6 +2037,7 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
 
 
 def _managed_summary_call(agent, api_request_id: str, request, callback, *, retry_count: int):
+    throttle_before_request(agent, getattr(agent, "provider", "") or "", getattr(agent, "model", "") or "")
     from agent import relay_llm
     return relay_llm.execute_current(
         request, callback,
