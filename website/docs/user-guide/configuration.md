@@ -159,6 +159,16 @@ You can also set `providers.<id>.stale_timeout_seconds` for the non-streaming st
 
 Leaving these unset keeps the legacy defaults (`HERMES_API_TIMEOUT=1800`s, `HERMES_API_CALL_STALE_TIMEOUT=90`s, native Anthropic 900s). The non-streaming stale detector is auto-disabled for local endpoints when left implicit and can scale upward for very large contexts. Not currently wired for AWS Bedrock (both `bedrock_converse` and AnthropicBedrock SDK paths use boto3 with its own timeout configuration). See the commented example in [`cli-config.yaml.example`](https://github.com/NousResearch/hermes-agent/blob/main/cli-config.yaml.example).
 
+### Proactive Rate Limiting
+
+Set `providers.<id>.requests_per_minute` to pace outbound requests to that provider so Hermes stays under a known rate limit instead of waiting to hit a 429. A per-model override, `providers.<id>.models.<model>.requests_per_minute`, wins over the provider-wide setting. Unset, zero, or negative disables pacing (the default — no overhead).
+
+Pacing is in-process only, per `(provider, model)`: it spaces this Hermes process's own requests, but does not coordinate across separate processes or sessions (CLI, cron, gateway) sharing the same provider account. This complements, rather than replaces, the reactive Nous Portal rate-limit breaker, which reacts after a real 429 and does coordinate across sessions via a shared state file.
+
+To confirm pacing is active: a wait longer than 5 seconds prints a visible `⏳ Pacing requests to <provider>/<model> (...)` notice; a shorter wait (the common case at realistic RPM values) stays silent but is always logged at DEBUG under the `agent.rate_limit_throttle` logger — run with `-v`/`--verbose` (or set `logging.level: DEBUG`) and check `hermes logs -f` for that line. To see the visible notice on demand, temporarily set a low `requests_per_minute` (e.g. `2`) and restart.
+
+A second, independent dimension paces on input tokens: `providers.<id>.input_tokens_per_minute` (with the same `providers.<id>.models.<model>.input_tokens_per_minute` override) throttles to a tokens-per-minute ceiling instead of a request count. It's a leaky bucket fed by each response's actual (provider-confirmed) input-token usage; before sending, a rough size estimate for the upcoming request (total request characters ÷ 4 — no tokenizer, so it's approximate) is projected on top of the bucket's current level to avoid firing an obviously oversized request into an already-full bucket. A single request whose estimate alone exceeds the configured ceiling is sent anyway — logged as a warning, and printed to the console — since no amount of waiting can make it fit in one window, and Hermes does not split or compress a request to make it fit.
+
 ## Update Behavior
 
 ### Background checks

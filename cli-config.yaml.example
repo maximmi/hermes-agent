@@ -258,6 +258,37 @@ model:
 #       gpt-5.4:
 #         stale_timeout_seconds: 1800  # Longer non-stream stale timeout for slow large-context turns
 
+# ``requests_per_minute`` proactively paces outbound requests to stay under a
+# provider's rate limit, instead of waiting to hit a 429. Per-model
+# providers.<id>.models.<model>.requests_per_minute wins over the
+# provider-wide providers.<id>.requests_per_minute. Unset/0/negative disables
+# pacing (the default). In-process only (not shared across separate hermes
+# processes/sessions hitting the same limit).
+#
+# providers:
+#   nim:
+#     requests_per_minute: 40    # Nvidia NIM's overall rate limit
+#     models:
+#       minimax:
+#         requests_per_minute: 40  # This model's own (tighter) limit
+#
+# ``input_tokens_per_minute`` is a second, independent throttle dimension —
+# same providers.<id> / providers.<id>.models.<model> override pattern, its
+# own on/off switch. A leaky bucket fed by actual (provider-confirmed) input
+# tokens after each response; before sending, a rough size estimate
+# (total request characters / 4 — no tokenizer) is projected on top of it to
+# avoid firing an obviously oversized request into an already-full bucket.
+# A single request whose estimate alone exceeds the ceiling is sent anyway
+# (with a warning) — no amount of waiting can make it fit, and Hermes does
+# not split or compress a request to make it fit.
+#
+# providers:
+#   openrouter:
+#     input_tokens_per_minute: 100000
+#     models:
+#       some/model-with-a-tighter-tpm-limit:
+#         input_tokens_per_minute: 20000
+
 # =============================================================================
 # Unified Timeouts (operation deadlines)
 # =============================================================================
