@@ -219,6 +219,10 @@ class CLIStatusBarMixin:
             "context_tokens": 0,
             "context_length": None,
             "context_percent": None,
+            "rpm_used": None,
+            "rpm_limit": None,
+            "tpm_used": None,
+            "tpm_limit": None,
             **dict.fromkeys(_AGENT_COUNTERS, 0),
             "compressions": 0,
             "active_background_tasks": 0,
@@ -393,6 +397,21 @@ class CLIStatusBarMixin:
         snapshot["avg_latency_label"] = f"{avg_lat:.1f}s" if avg_lat is not None else ""
         snapshot["avg_velocity"] = float(avg_vel) if avg_vel is not None else None
         snapshot["avg_velocity_label"] = f"{avg_vel:.0f} t/s" if avg_vel is not None else ""
+
+        # Live proactive-throttle usage (agent/rate_limit_throttle.py) — hidden entirely
+        # unless requests_per_minute / input_tokens_per_minute is configured for this pair.
+        try:
+            from agent.rate_limit_throttle import status_snapshot as _rl_status_snapshot
+            rl_status = _rl_status_snapshot(
+                str(getattr(agent, "provider", "") or ""), str(model_name or ""),
+            )
+        except Exception:
+            rl_status = None
+        if rl_status is not None:
+            snapshot["rpm_used"] = rl_status.rpm_used
+            snapshot["rpm_limit"] = rl_status.rpm_limit
+            snapshot["tpm_used"] = rl_status.tpm_used
+            snapshot["tpm_limit"] = rl_status.tpm_limit
         return snapshot
 
     def _get_status_bar_session_title(self) -> str:
@@ -1068,6 +1087,22 @@ class CLIStatusBarMixin:
                     label = snapshot.get(key) or ""
                     if label:
                         add(name, _DIM, f"{glyph} {label}")
+                rpm_limit = snapshot.get("rpm_limit")
+                if rpm_limit is not None and _ok("rpm"):
+                    rpm_used = snapshot.get("rpm_used") or 0
+                    pct = max(0, min(100, round(rpm_used / rpm_limit * 100))) if rpm_limit else 0
+                    segs.append([(
+                        self._status_bar_context_style(pct),
+                        f"⇅{rpm_used}/{format_token_count_compact(int(rpm_limit))}",
+                    )])
+                tpm_limit = snapshot.get("tpm_limit")
+                if tpm_limit is not None and _ok("tpm"):
+                    tpm_used = snapshot.get("tpm_used") or 0.0
+                    pct = max(0, min(100, round(tpm_used / tpm_limit * 100))) if tpm_limit else 0
+                    segs.append([(
+                        self._status_bar_context_style(pct),
+                        f"⇥{format_token_count_compact(int(tpm_used))}/{format_token_count_compact(int(tpm_limit))}",
+                    )])
             add_count("compressions", "compressions", "🗜️", self._compression_count_style)
             add_count("bg_tasks", "active_background_tasks", "▶")
             add_count("bg_processes", "active_background_processes", "⚙")
