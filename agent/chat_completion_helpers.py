@@ -39,7 +39,7 @@ from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
-from agent.rate_limit_throttle import throttle_before_request
+from agent.rate_limit_throttle import record_input_tokens, throttle_before_request
 from agent.message_sanitization import (
     _sanitize_surrogates, _repair_tool_call_arguments, normalize_finish_reason as _normalize_finish_reason,
     sanitize_outbound_kwargs,
@@ -2037,15 +2037,28 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
 
 
 def _managed_summary_call(agent, api_request_id: str, request, callback, *, retry_count: int):
-    throttle_before_request(agent, getattr(agent, "provider", "") or "", getattr(agent, "model", "") or "")
+    provider = getattr(agent, "provider", "") or ""
+    model = getattr(agent, "model", "") or ""
+    throttle_before_request(agent, provider, model, request)
     from agent import relay_llm
-    return relay_llm.execute_current(
+    response = relay_llm.execute_current(
         request, callback,
-        name=str(getattr(agent, "provider", "") or "provider"), model_name=str(getattr(agent, "model", "") or ""),
+        name=str(provider or "provider"), model_name=str(model),
         metadata={"api_mode": str(getattr(agent, "api_mode", "") or "chat_completions"),
             "api_request_id": api_request_id, "call_role": "iteration_summary", "retry_count": retry_count},
         defer_logical_completion=True,
     )
+    # This path never runs through turn_usage.record_response_usage (the main loop's
+    # accounting chokepoint), so the TPM bucket must be fed here instead.
+    usage = getattr(response, "usage", None)
+    if usage:
+        try:
+            from agent.usage_pricing import normalize_usage
+            canonical_usage = normalize_usage(usage, provider=provider, api_mode=getattr(agent, "api_mode", ""))
+            record_input_tokens(provider, model, canonical_usage.prompt_tokens)
+        except Exception:
+            pass  # Never let TPM accounting break the summary path
+    return response
 
 
 def _summary_text(agent, response, **normalize_kwargs) -> str:

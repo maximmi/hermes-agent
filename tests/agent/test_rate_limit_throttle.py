@@ -16,14 +16,16 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _reset_limiter_registry():
-    """The module-level limiter registry is a process-wide singleton keyed
-    by (provider, model); without resetting it, one test's schedule leaks
+    """The module-level limiter registries are process-wide singletons keyed
+    by (provider, model); without resetting them, one test's schedule leaks
     into the next test that happens to reuse the same key."""
     import agent.rate_limit_throttle as mod
 
     mod._limiters.clear()
+    mod._token_limiters.clear()
     yield
     mod._limiters.clear()
+    mod._token_limiters.clear()
 
 
 class TestRateLimiterScheduling:
@@ -95,6 +97,7 @@ class TestThrottleBeforeRequest:
         import agent.rate_limit_throttle as mod
 
         monkeypatch.setattr(mod, "get_provider_requests_per_minute", lambda *_a, **_kw: None)
+        monkeypatch.setattr(mod, "get_provider_input_tokens_per_minute", lambda *_a, **_kw: None)
         sleeps = []
         monkeypatch.setattr(mod.time, "sleep", lambda s: sleeps.append(s))
 
@@ -106,6 +109,7 @@ class TestThrottleBeforeRequest:
         import agent.rate_limit_throttle as mod
 
         monkeypatch.setattr(mod, "get_provider_requests_per_minute", lambda *_a, **_kw: 60.0)
+        monkeypatch.setattr(mod, "get_provider_input_tokens_per_minute", lambda *_a, **_kw: None)
         limiter = mod.RateLimiter(60.0)
         monkeypatch.setattr(mod, "_get_limiter", lambda *_a, **_kw: limiter)
         sleeps = []
@@ -120,6 +124,7 @@ class TestThrottleBeforeRequest:
         import agent.rate_limit_throttle as mod
 
         monkeypatch.setattr(mod, "get_provider_requests_per_minute", lambda *_a, **_kw: 1.0)  # 60s interval
+        monkeypatch.setattr(mod, "get_provider_input_tokens_per_minute", lambda *_a, **_kw: None)
         monkeypatch.setattr(mod.time, "sleep", lambda s: None)
         notices = []
         agent = SimpleNamespace(log_prefix="", _vprint=lambda *a, **kw: notices.append(a[0]))
@@ -134,6 +139,7 @@ class TestThrottleBeforeRequest:
         import agent.rate_limit_throttle as mod
 
         monkeypatch.setattr(mod, "get_provider_requests_per_minute", lambda *_a, **_kw: 60.0)  # 1s interval
+        monkeypatch.setattr(mod, "get_provider_input_tokens_per_minute", lambda *_a, **_kw: None)
         monkeypatch.setattr(mod.time, "sleep", lambda s: None)
         notices = []
         agent = SimpleNamespace(log_prefix="", _vprint=lambda *a, **kw: notices.append(a[0]))
@@ -150,6 +156,7 @@ class TestThrottleBeforeRequest:
         import agent.rate_limit_throttle as mod
 
         monkeypatch.setattr(mod, "get_provider_requests_per_minute", lambda *_a, **_kw: 6000.0)
+        monkeypatch.setattr(mod, "get_provider_input_tokens_per_minute", lambda *_a, **_kw: None)
         monkeypatch.setattr(mod.time, "sleep", lambda s: None)
 
         with caplog.at_level("DEBUG", logger="agent.rate_limit_throttle"):
@@ -196,3 +203,232 @@ class TestConcurrentAcquisition:
         assert sorted_slots[0] - start == pytest.approx(0.0, abs=0.05)
         gaps = [b - a for a, b in zip(sorted_slots, sorted_slots[1:])]
         assert all(gap >= 0.01 - 1e-6 for gap in gaps)
+
+
+class TestTokenBucketLimiter:
+    def test_first_call_has_zero_wait(self):
+        from agent.rate_limit_throttle import TokenBucketLimiter
+
+        limiter = TokenBucketLimiter(capacity=1000)  # rate = 1000/60 tok/s
+        assert limiter.wait_time(now=0.0) == 0.0
+
+    def test_recorded_usage_pushes_the_bucket_over_capacity(self):
+        from agent.rate_limit_throttle import TokenBucketLimiter
+
+        limiter = TokenBucketLimiter(capacity=1000)
+        limiter.record_usage(1500, now=0.0)  # 500 over capacity
+        # rate = 1000/60 tok/s -> draining the 500 overage takes 30s
+        assert limiter.wait_time(now=0.0) == pytest.approx(30.0)
+
+    def test_bucket_drains_linearly_over_time(self):
+        from agent.rate_limit_throttle import TokenBucketLimiter
+
+        limiter = TokenBucketLimiter(capacity=1000)
+        limiter.record_usage(1500, now=0.0)  # level=1500, 500 over
+        # Halfway through the 30s drain: 250 tokens have leaked out.
+        assert limiter.wait_time(now=15.0) == pytest.approx(15.0)
+        assert limiter.wait_time(now=30.0) == pytest.approx(0.0)
+        assert limiter.wait_time(now=60.0) == pytest.approx(0.0)  # never goes negative
+
+    def test_estimated_tokens_included_in_the_projection(self):
+        from agent.rate_limit_throttle import TokenBucketLimiter
+
+        limiter = TokenBucketLimiter(capacity=1000)
+        # Empty bucket, but this request alone would use 700 of the 1000 budget.
+        assert limiter.wait_time(estimated_tokens=700, now=0.0) == 0.0
+        # Two such requests back to back (bucket still empty since estimate
+        # is never permanently reserved) both see zero wait...
+        assert limiter.wait_time(estimated_tokens=700, now=0.0) == 0.0
+        # ...but once actual usage lands, the next estimate is projected on top of it.
+        limiter.record_usage(700, now=0.0)
+        assert limiter.wait_time(estimated_tokens=700, now=0.0) == pytest.approx(24.0)  # (700+700-1000)/(1000/60)
+
+    def test_estimate_beyond_capacity_is_clamped_not_unbounded(self):
+        """A single request whose rough estimate alone exceeds the whole
+        per-minute budget cannot be satisfied by waiting — clamp the
+        estimate's contribution to `capacity` so the wait is bounded by the
+        real (confirmed) backlog only, not by how wildly the estimate
+        overshoots."""
+        from agent.rate_limit_throttle import TokenBucketLimiter
+
+        limiter = TokenBucketLimiter(capacity=1000)
+        limiter.record_usage(500, now=0.0)  # some real backlog
+        wait = limiter.wait_time(estimated_tokens=500_000, now=0.0)
+        # Clamped: effective estimate = capacity (1000) -> projected = 1500 -> wait = 500/(1000/60) = 30s
+        assert wait == pytest.approx(30.0)
+        assert wait < 60.0  # bounded regardless of how large the estimate is
+
+    def test_update_capacity_changes_rate_without_resetting_level(self):
+        from agent.rate_limit_throttle import TokenBucketLimiter
+
+        limiter = TokenBucketLimiter(capacity=1000)
+        limiter.record_usage(1500, now=0.0)  # 500 over capacity=1000
+        limiter.update_capacity(2000)  # level (1500) unchanged, but now under the new capacity
+        assert limiter.wait_time(now=0.0) == 0.0
+
+    def test_wait_time_never_sleeps_regardless_of_backlog_size(self):
+        from agent.rate_limit_throttle import TokenBucketLimiter
+
+        limiter = TokenBucketLimiter(capacity=1)  # tiny capacity -> huge backlog possible
+        limiter.record_usage(1_000_000, now=0.0)
+        start = time.monotonic()
+        wait = limiter.wait_time(now=0.0)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 0.1  # never actually sleeps inside wait_time()
+        assert wait > 1000  # (a huge, but computed-not-slept, wait)
+
+
+class TestTokenLimiterRegistry:
+    def test_same_key_reuses_the_limiter_instance(self):
+        from agent.rate_limit_throttle import _get_token_limiter
+
+        a = _get_token_limiter("nim", "minimax", 1000)
+        b = _get_token_limiter("nim", "minimax", 1000)
+        assert a is b
+
+    def test_different_keys_get_independent_limiters(self):
+        from agent.rate_limit_throttle import _get_token_limiter
+
+        a = _get_token_limiter("nim", "minimax", 1000)
+        b = _get_token_limiter("nim", "other-model", 1000)
+        assert a is not b
+
+
+class TestEstimateRequestTokens:
+    def test_sums_string_lengths_across_nested_structure(self):
+        from agent.rate_limit_throttle import _estimate_request_tokens
+
+        request = {
+            "model": "x",  # 1 char
+            "messages": [
+                {"role": "user", "content": "a" * 40},
+                {"role": "assistant", "content": "b" * 60},
+            ],
+        }
+        # "x"(1) + "user"(4)+40 + "assistant"(9)+60 = 1+4+40+9+60 = 114 -> //4 = 28
+        assert _estimate_request_tokens(request) == 28
+
+    def test_ignores_non_string_leaves(self):
+        from agent.rate_limit_throttle import _estimate_request_tokens
+
+        assert _estimate_request_tokens({"n": 12345, "flag": True, "x": None}) == 0
+
+    def test_empty_or_none_request_is_zero(self):
+        from agent.rate_limit_throttle import _estimate_request_tokens
+
+        assert _estimate_request_tokens(None) == 0
+        assert _estimate_request_tokens({}) == 0
+
+    def test_never_raises_on_unexpected_shapes(self):
+        from agent.rate_limit_throttle import _estimate_request_tokens
+
+        class Weird:
+            def __iter__(self):
+                raise RuntimeError("boom")
+
+        assert _estimate_request_tokens(Weird()) == 0
+
+
+class TestRecordInputTokens:
+    def test_noop_when_unconfigured(self, monkeypatch):
+        import agent.rate_limit_throttle as mod
+
+        monkeypatch.setattr(mod, "get_provider_input_tokens_per_minute", lambda *_a, **_kw: None)
+        mod.record_input_tokens("openrouter", "anything", 99999)  # must not raise, no limiter created
+
+        assert mod._token_limiters == {}
+
+    def test_feeds_the_bucket_for_the_configured_pair(self, monkeypatch):
+        import agent.rate_limit_throttle as mod
+
+        monkeypatch.setattr(mod, "get_provider_input_tokens_per_minute", lambda *_a, **_kw: 1000.0)
+        mod.record_input_tokens("nim", "minimax", 1500)
+
+        limiter = mod._token_limiters[("nim", "minimax")]
+        assert limiter.wait_time(now=0.0) == pytest.approx(30.0)
+
+
+class TestThrottleBeforeRequestTokens:
+    def test_tpm_only_wait_when_rpm_unconfigured(self, monkeypatch):
+        import agent.rate_limit_throttle as mod
+
+        monkeypatch.setattr(mod, "get_provider_requests_per_minute", lambda *_a, **_kw: None)
+        monkeypatch.setattr(mod, "get_provider_input_tokens_per_minute", lambda *_a, **_kw: 1000.0)
+        limiter = mod.TokenBucketLimiter(1000.0)
+        limiter.record_usage(1500)  # pre-loaded 500 over capacity (real clock: throttle_before_request reads it moments later)
+        monkeypatch.setattr(mod, "_get_token_limiter", lambda *_a, **_kw: limiter)
+        sleeps = []
+        monkeypatch.setattr(mod.time, "sleep", lambda s: sleeps.append(s))
+
+        mod.throttle_before_request(None, "nim", "minimax", request={})
+
+        assert sleeps == [pytest.approx(30.0, abs=0.5)]
+
+    def test_combined_delay_is_the_max_of_both_dimensions(self, monkeypatch):
+        import agent.rate_limit_throttle as mod
+
+        monkeypatch.setattr(mod, "get_provider_requests_per_minute", lambda *_a, **_kw: 60.0)  # 1s interval
+        rpm_limiter = mod.RateLimiter(60.0)
+        rpm_limiter.wait_time()  # reserves a slot ~1s out; real clock, read moments later below
+        monkeypatch.setattr(mod, "_get_limiter", lambda *_a, **_kw: rpm_limiter)
+
+        monkeypatch.setattr(mod, "get_provider_input_tokens_per_minute", lambda *_a, **_kw: 1000.0)
+        token_limiter = mod.TokenBucketLimiter(1000.0)
+        token_limiter.record_usage(6000)  # 5000 over -> (5000)/(1000/60) = 300s, way bigger than RPM's ~1s
+        monkeypatch.setattr(mod, "_get_token_limiter", lambda *_a, **_kw: token_limiter)
+
+        sleeps = []
+        monkeypatch.setattr(mod.time, "sleep", lambda s: sleeps.append(s))
+
+        mod.throttle_before_request(None, "nim", "minimax", request={})
+
+        assert sleeps == [pytest.approx(300.0, abs=0.5)]  # TPM dominates
+
+    def test_estimate_over_capacity_warns_and_still_sends(self, monkeypatch, caplog):
+        import agent.rate_limit_throttle as mod
+
+        monkeypatch.setattr(mod, "get_provider_requests_per_minute", lambda *_a, **_kw: None)
+        monkeypatch.setattr(mod, "get_provider_input_tokens_per_minute", lambda *_a, **_kw: 100.0)
+        monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+        notices = []
+        agent = SimpleNamespace(log_prefix="", _vprint=lambda *a, **kw: notices.append(a[0]))
+
+        with caplog.at_level("WARNING", logger="agent.rate_limit_throttle"):
+            # "x" * 4000 -> estimate ~1000 tokens, way over the 100/min ceiling.
+            mod.throttle_before_request(agent, "nim", "minimax", request={"messages": [{"content": "x" * 4000}]})
+
+        assert any("exceeds" in r.message for r in caplog.records if r.levelname == "WARNING")
+        assert any("exceeds" in n for n in notices)
+
+    def test_estimate_within_capacity_does_not_warn(self, monkeypatch, caplog):
+        import agent.rate_limit_throttle as mod
+
+        monkeypatch.setattr(mod, "get_provider_requests_per_minute", lambda *_a, **_kw: None)
+        monkeypatch.setattr(mod, "get_provider_input_tokens_per_minute", lambda *_a, **_kw: 100_000.0)
+        monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+        notices = []
+        agent = SimpleNamespace(log_prefix="", _vprint=lambda *a, **kw: notices.append(a[0]))
+
+        with caplog.at_level("WARNING", logger="agent.rate_limit_throttle"):
+            mod.throttle_before_request(agent, "nim", "minimax", request={"messages": [{"content": "hi"}]})
+
+        assert not any(r.levelname == "WARNING" for r in caplog.records)
+        assert notices == []
+
+    def test_no_request_payload_means_zero_estimate(self, monkeypatch):
+        """Callers that don't pass a request body (or pass None) get a 0
+        estimate — TPM gating still applies to real recorded usage, just
+        without a pre-send size check."""
+        import agent.rate_limit_throttle as mod
+
+        monkeypatch.setattr(mod, "get_provider_requests_per_minute", lambda *_a, **_kw: None)
+        monkeypatch.setattr(mod, "get_provider_input_tokens_per_minute", lambda *_a, **_kw: 1000.0)
+        limiter = mod.TokenBucketLimiter(1000.0)
+        monkeypatch.setattr(mod, "_get_token_limiter", lambda *_a, **_kw: limiter)
+        sleeps = []
+        monkeypatch.setattr(mod.time, "sleep", lambda s: sleeps.append(s))
+
+        mod.throttle_before_request(None, "nim", "minimax")  # no request kwarg at all
+
+        assert sleeps == []

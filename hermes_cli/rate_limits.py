@@ -1,9 +1,11 @@
 """Config resolver for proactive client-side request throttling.
 
 Mirrors ``hermes_cli.timeouts``: a per-model
-``providers.<id>.models.<model>.requests_per_minute`` wins over the
-provider-wide ``providers.<id>.requests_per_minute``. Absent or <= 0 means
-disabled (the default).
+``providers.<id>.models.<model>.<key>`` wins over the provider-wide
+``providers.<id>.<key>``. Absent or <= 0 means disabled (the default).
+
+Two independent throttle dimensions, each its own on/off switch:
+``requests_per_minute`` and ``input_tokens_per_minute``.
 """
 
 from __future__ import annotations
@@ -11,16 +13,15 @@ from __future__ import annotations
 from typing import Optional
 
 
-def _coerce_rpm(raw: object) -> Optional[float]:
+def _coerce_positive(raw: object) -> Optional[float]:
     try:
-        rpm = float(raw)
+        value = float(raw)
     except (TypeError, ValueError):
         return None
-    return rpm if rpm > 0 else None
+    return value if value > 0 else None
 
 
-def get_provider_requests_per_minute(provider_id: str, model: Optional[str] = None) -> Optional[float]:
-    """Return the configured requests-per-minute throttle ceiling, if any."""
+def _configured_value(provider_id: str, model: Optional[str], key: str) -> Optional[float]:
     if not provider_id:
         return None
     try:
@@ -36,7 +37,17 @@ def get_provider_requests_per_minute(provider_id: str, model: Optional[str] = No
         models = provider_config.get("models", {})
         model_config = models.get(model, {}) if isinstance(models, dict) else {}
         if isinstance(model_config, dict):
-            rpm = _coerce_rpm(model_config.get("requests_per_minute"))
-            if rpm is not None:
-                return rpm
-    return _coerce_rpm(provider_config.get("requests_per_minute"))
+            value = _coerce_positive(model_config.get(key))
+            if value is not None:
+                return value
+    return _coerce_positive(provider_config.get(key))
+
+
+def get_provider_requests_per_minute(provider_id: str, model: Optional[str] = None) -> Optional[float]:
+    """Return the configured requests-per-minute throttle ceiling, if any."""
+    return _configured_value(provider_id, model, "requests_per_minute")
+
+
+def get_provider_input_tokens_per_minute(provider_id: str, model: Optional[str] = None) -> Optional[float]:
+    """Return the configured input-tokens-per-minute throttle ceiling, if any."""
+    return _configured_value(provider_id, model, "input_tokens_per_minute")

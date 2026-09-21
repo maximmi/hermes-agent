@@ -68,7 +68,7 @@ def perform_api_call(
     interrupted: Any,
 ) -> ApiCallVerdict:
     """Issue the request (see ``_should_stream`` for the streaming decision)."""
-    throttle_before_request(agent, agent.provider, agent.model)
+    throttle_before_request(agent, agent.provider, agent.model, api_kwargs)
     response = None
 
     def _verdict(action: str) -> ApiCallVerdict:

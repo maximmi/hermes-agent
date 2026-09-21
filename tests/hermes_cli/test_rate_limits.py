@@ -73,3 +73,49 @@ def test_unconfigured_provider_id_returns_none(monkeypatch, tmp_path):
             requests_per_minute: 40
         """)
     assert rl.get_provider_requests_per_minute("openrouter", "minimax") is None
+
+
+class TestInputTokensPerMinute:
+    """Same provider/per-model-override pattern, independent of requests_per_minute."""
+
+    def test_disabled_when_unconfigured(self, monkeypatch, tmp_path):
+        rl = _reload_with_config(monkeypatch, tmp_path, "")
+        assert rl.get_provider_input_tokens_per_minute("nim", "minimax") is None
+
+    def test_provider_level_setting_is_used(self, monkeypatch, tmp_path):
+        rl = _reload_with_config(monkeypatch, tmp_path, """\
+            providers:
+              nim:
+                input_tokens_per_minute: 100000
+            """)
+        assert rl.get_provider_input_tokens_per_minute("nim", "minimax") == 100000.0
+
+    def test_per_model_override_wins_over_provider_level(self, monkeypatch, tmp_path):
+        rl = _reload_with_config(monkeypatch, tmp_path, """\
+            providers:
+              nim:
+                input_tokens_per_minute: 100000
+                models:
+                  minimax:
+                    input_tokens_per_minute: 20000
+            """)
+        assert rl.get_provider_input_tokens_per_minute("nim", "minimax") == 20000.0
+        assert rl.get_provider_input_tokens_per_minute("nim", "other-model") == 100000.0
+
+    def test_zero_or_negative_means_disabled(self, monkeypatch, tmp_path):
+        rl = _reload_with_config(monkeypatch, tmp_path, """\
+            providers:
+              nim:
+                input_tokens_per_minute: 0
+            """)
+        assert rl.get_provider_input_tokens_per_minute("nim") is None
+
+    def test_independent_of_requests_per_minute(self, monkeypatch, tmp_path):
+        """Setting one throttle dimension must not implicitly enable the other."""
+        rl = _reload_with_config(monkeypatch, tmp_path, """\
+            providers:
+              nim:
+                requests_per_minute: 40
+            """)
+        assert rl.get_provider_input_tokens_per_minute("nim") is None
+        assert rl.get_provider_requests_per_minute("nim") == 40.0
