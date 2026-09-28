@@ -68,6 +68,26 @@ class TestNormalizeCustomProviderEntry:
         assert result["base_url"] == "${PROVIDER_A_BASE_URL}"
 
 
+    def test_rate_limit_keys_not_warned_as_unknown(self, caplog):
+        """`requests_per_minute` / `input_tokens_per_minute` are documented,
+        actively-used provider keys (read by rate_limits.py to drive
+        rate_limit_throttle.py) and must not trigger the 'unknown config
+        keys ignored' warning."""
+        entry = {
+            "base_url": "https://api.example.com/v1",
+            "api_key": "***",
+            "requests_per_minute": 60,
+            "input_tokens_per_minute": 100000,
+        }
+        with caplog.at_level(logging.WARNING):
+            result = _normalize_custom_provider_entry(entry, provider_key="test")
+        unknown_warnings = [
+            r for r in caplog.records
+            if "unknown config keys" in r.message.lower()
+        ]
+        assert result is not None
+        assert not unknown_warnings
+
     def test_numeric_yaml_name_and_key_become_strings(self):
         """Unquoted YAML `name: 2070` / key 2070 must not be dropped as non-str."""
         from hermes_cli.config import find_provider_entry, stringify_provider_map
