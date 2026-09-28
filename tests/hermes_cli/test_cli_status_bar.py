@@ -668,6 +668,83 @@ class TestRollingLatencyVelocity:
         assert snapshot["avg_velocity"] is None
 
 
+class TestRateLimitStatusBarSegment:
+    """Live RPM/TPM from agent/rate_limit_throttle.py — hidden unless a
+    limit is configured for the current provider/model."""
+
+    def _configure(self, monkeypatch, *, rpm=None, tpm=None):
+        import agent.rate_limit_throttle as rl_mod
+        monkeypatch.setattr(rl_mod, "get_provider_requests_per_minute", lambda *_a, **_kw: rpm)
+        monkeypatch.setattr(rl_mod, "get_provider_input_tokens_per_minute", lambda *_a, **_kw: tpm)
+        rl_mod._limiters.clear()
+        rl_mod._token_limiters.clear()
+
+    def test_hidden_when_unconfigured(self, monkeypatch):
+        self._configure(monkeypatch)
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_000, completion_tokens=2_000, total_tokens=12_000,
+            api_calls=5, context_tokens=12_000, context_length=200_000,
+        )
+
+        text = cli_obj._build_status_bar_text(width=140)
+
+        assert "⇅" not in text
+        assert "⇥" not in text
+
+    def test_rpm_shown_when_configured(self, monkeypatch):
+        self._configure(monkeypatch, rpm=40)
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_000, completion_tokens=2_000, total_tokens=12_000,
+            api_calls=5, context_tokens=12_000, context_length=200_000,
+        )
+
+        text = cli_obj._build_status_bar_text(width=140)
+
+        assert "⇅0/40" in text
+        assert "⇥" not in text
+
+    def test_tpm_shown_when_configured(self, monkeypatch):
+        self._configure(monkeypatch, tpm=100_000)
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_000, completion_tokens=2_000, total_tokens=12_000,
+            api_calls=5, context_tokens=12_000, context_length=200_000,
+        )
+
+        text = cli_obj._build_status_bar_text(width=140)
+
+        assert "⇥0/100K" in text
+        assert "⇅" not in text
+
+    def test_narrow_terminal_hides_the_segment(self, monkeypatch):
+        self._configure(monkeypatch, rpm=40, tpm=100_000)
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_000, completion_tokens=2_000, total_tokens=12_000,
+            api_calls=5, context_tokens=12_000, context_length=200_000,
+        )
+
+        text = cli_obj._build_status_bar_text(width=60)
+
+        assert "⇅" not in text
+        assert "⇥" not in text
+
+    def test_field_filter_hides_rpm_and_tpm_independently(self, monkeypatch):
+        self._configure(monkeypatch, rpm=40, tpm=100_000)
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_000, completion_tokens=2_000, total_tokens=12_000,
+            api_calls=5, context_tokens=12_000, context_length=200_000,
+        )
+        with patch.object(cli_mod, "CLI_CONFIG", {"display": {"status_bar": {"fields": ["model", "rpm"]}}}):
+            text = cli_obj._build_status_bar_text(width=140)
+
+        assert "⇅0/40" in text
+        assert "⇥" not in text
+
+
 class TestCacheHitBaselineReset:
     def test_baseline_resets_on_model_switch(self):
         cli_obj = _attach_agent(

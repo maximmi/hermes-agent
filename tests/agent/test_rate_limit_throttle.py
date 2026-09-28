@@ -432,3 +432,107 @@ class TestThrottleBeforeRequestTokens:
         mod.throttle_before_request(None, "nim", "minimax")  # no request kwarg at all
 
         assert sleeps == []
+
+
+class TestRateLimiterCurrentRequests:
+    """Rolling 60s request count, for live status-bar display — separate
+    from the single-slot scheduler used for actual pacing."""
+
+    def test_zero_before_any_call(self):
+        from agent.rate_limit_throttle import RateLimiter
+
+        limiter = RateLimiter(requests_per_minute=60)
+        assert limiter.current_requests(now=0.0) == 0
+
+    def test_counts_calls_within_the_last_60_seconds(self):
+        from agent.rate_limit_throttle import RateLimiter
+
+        limiter = RateLimiter(requests_per_minute=6000)  # fast enough not to gate
+        limiter.wait_time(now=0.0)
+        limiter.wait_time(now=10.0)
+        limiter.wait_time(now=20.0)
+        assert limiter.current_requests(now=20.0) == 3
+
+    def test_calls_older_than_60_seconds_expire(self):
+        from agent.rate_limit_throttle import RateLimiter
+
+        limiter = RateLimiter(requests_per_minute=6000)
+        limiter.wait_time(now=0.0)
+        limiter.wait_time(now=10.0)
+        assert limiter.current_requests(now=65.0) == 1  # only the t=10 call remains
+
+
+class TestTokenBucketLimiterCurrentLevel:
+    def test_zero_before_any_usage(self):
+        from agent.rate_limit_throttle import TokenBucketLimiter
+
+        limiter = TokenBucketLimiter(capacity=1000)
+        assert limiter.current_level(now=0.0) == 0.0
+
+    def test_reflects_recorded_usage(self):
+        from agent.rate_limit_throttle import TokenBucketLimiter
+
+        limiter = TokenBucketLimiter(capacity=1000)
+        limiter.record_usage(300, now=0.0)
+        assert limiter.current_level(now=0.0) == pytest.approx(300.0)
+
+    def test_drains_over_time_like_wait_time_does(self):
+        from agent.rate_limit_throttle import TokenBucketLimiter
+
+        limiter = TokenBucketLimiter(capacity=600)  # drains at 10/sec
+        limiter.record_usage(300, now=0.0)
+        assert limiter.current_level(now=10.0) == pytest.approx(200.0)
+
+
+class TestStatusSnapshot:
+    """Live RPM/TPM usage for the status bar: hidden entirely when neither
+    dimension is configured for (provider, model); each configured
+    dimension reports (used, limit) independently."""
+
+    def test_none_when_neither_dimension_configured(self, monkeypatch):
+        import agent.rate_limit_throttle as mod
+
+        monkeypatch.setattr(mod, "get_provider_requests_per_minute", lambda *_a, **_kw: None)
+        monkeypatch.setattr(mod, "get_provider_input_tokens_per_minute", lambda *_a, **_kw: None)
+
+        assert mod.status_snapshot("nim", "minimax") is None
+
+    def test_rpm_only(self, monkeypatch):
+        import agent.rate_limit_throttle as mod
+
+        monkeypatch.setattr(mod, "get_provider_requests_per_minute", lambda *_a, **_kw: 40.0)
+        monkeypatch.setattr(mod, "get_provider_input_tokens_per_minute", lambda *_a, **_kw: None)
+        mod.throttle_before_request(None, "nim", "minimax")  # one real request recorded
+
+        snap = mod.status_snapshot("nim", "minimax")
+
+        assert snap is not None
+        assert snap.rpm_used == 1
+        assert snap.rpm_limit == 40.0
+        assert snap.tpm_used is None
+        assert snap.tpm_limit is None
+
+    def test_tpm_only(self, monkeypatch):
+        import agent.rate_limit_throttle as mod
+
+        monkeypatch.setattr(mod, "get_provider_requests_per_minute", lambda *_a, **_kw: None)
+        monkeypatch.setattr(mod, "get_provider_input_tokens_per_minute", lambda *_a, **_kw: 1000.0)
+        mod.record_input_tokens("nim", "minimax", 250)
+
+        snap = mod.status_snapshot("nim", "minimax")
+
+        assert snap is not None
+        assert snap.rpm_used is None
+        assert snap.rpm_limit is None
+        assert snap.tpm_used == pytest.approx(250.0)
+        assert snap.tpm_limit == 1000.0
+
+    def test_both_dimensions_before_any_traffic_report_zero_used(self, monkeypatch):
+        import agent.rate_limit_throttle as mod
+
+        monkeypatch.setattr(mod, "get_provider_requests_per_minute", lambda *_a, **_kw: 40.0)
+        monkeypatch.setattr(mod, "get_provider_input_tokens_per_minute", lambda *_a, **_kw: 1000.0)
+
+        snap = mod.status_snapshot("nim", "minimax")
+
+        assert snap == mod.RateLimitStatus(rpm_used=0, rpm_limit=40.0, tpm_used=0.0, tpm_limit=1000.0)

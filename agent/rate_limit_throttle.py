@@ -22,6 +22,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 from hermes_cli.rate_limits import (
@@ -45,6 +47,7 @@ class RateLimiter:
         self._lock = threading.Lock()
         self._next_slot = 0.0
         self._interval = 60.0 / requests_per_minute
+        self._recent_calls: "deque[float]" = deque()
 
     def update_rate(self, requests_per_minute: float) -> None:
         with self._lock:
@@ -58,7 +61,18 @@ class RateLimiter:
         with self._lock:
             start = max(now, self._next_slot)
             self._next_slot = start + self._interval
+            self._recent_calls.append(now)
         return start - now
+
+    def current_requests(self, now: Optional[float] = None) -> int:
+        """Count of calls to ``wait_time`` in the trailing 60s window — a
+        live usage figure for display, independent of the scheduler above."""
+        if now is None:
+            now = time.monotonic()
+        with self._lock:
+            while self._recent_calls and now - self._recent_calls[0] > 60.0:
+                self._recent_calls.popleft()
+            return len(self._recent_calls)
 
 
 class TokenBucketLimiter:
@@ -114,6 +128,15 @@ class TokenBucketLimiter:
                 return 0.0
             return (projected - self._capacity) / self._rate
 
+    def current_level(self, now: Optional[float] = None) -> float:
+        """Current bucket fill after draining — a live "tokens used this
+        minute" figure for display."""
+        if now is None:
+            now = time.monotonic()
+        with self._lock:
+            self._drain_locked(now)
+            return self._level
+
 
 _limiters: Dict[Tuple[str, str], RateLimiter] = {}
 _registry_lock = threading.Lock()
@@ -165,6 +188,40 @@ def _estimate_request_tokens(request: Any) -> int:
         return _sum_string_lengths(request) // 4
     except Exception:
         return 0
+
+
+@dataclass(frozen=True)
+class RateLimitStatus:
+    """Live usage for one (provider, model), for status-bar display. Either
+    dimension is ``None`` when that dimension isn't configured."""
+
+    rpm_used: Optional[int]
+    rpm_limit: Optional[float]
+    tpm_used: Optional[float]
+    tpm_limit: Optional[float]
+
+
+def status_snapshot(provider: str, model: str) -> Optional[RateLimitStatus]:
+    """Live RPM/TPM usage for ``(provider, model)``, or ``None`` when
+    neither throttle dimension is configured for it (nothing to show).
+    Never triggers a request — a configured-but-idle pair reports 0 used."""
+    requests_per_minute = get_provider_requests_per_minute(provider, model)
+    input_tokens_per_minute = get_provider_input_tokens_per_minute(provider, model)
+    if requests_per_minute is None and input_tokens_per_minute is None:
+        return None
+
+    rpm_used: Optional[int] = None
+    if requests_per_minute is not None:
+        rpm_used = _get_limiter(provider, model, requests_per_minute).current_requests()
+
+    tpm_used: Optional[float] = None
+    if input_tokens_per_minute is not None:
+        tpm_used = _get_token_limiter(provider, model, input_tokens_per_minute).current_level()
+
+    return RateLimitStatus(
+        rpm_used=rpm_used, rpm_limit=requests_per_minute,
+        tpm_used=tpm_used, tpm_limit=input_tokens_per_minute,
+    )
 
 
 def record_input_tokens(provider: str, model: str, tokens: float) -> None:
